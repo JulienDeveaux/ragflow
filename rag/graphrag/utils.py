@@ -400,18 +400,31 @@ async def _embed_one_with_retry(embd_mdl, text, *, timeout):
             return ebd[0]
         except Exception as e:
             err = str(e)
+            err_lc = err.lower()
+            # Throttle signals (429 + provider-specific wording).
             is_throttle = (
                 "429" in err
-                or "rate limit" in err.lower()
-                or "ratelimit" in err.lower()
-                or "quota" in err.lower()
-                or "too many" in err.lower()
+                or "rate limit" in err_lc
+                or "ratelimit" in err_lc
+                or "quota" in err_lc
+                or "too many" in err_lc
             )
-            if attempt >= max_retries - 1 or not is_throttle:
+            # Scaleway's Envoy frontline returns ``403 - insufficient permissions``
+            # when its load shedder kicks in (the API key is still valid; the
+            # endpoint refuses the request because it is over-pressure).  Real
+            # 403 from invalid auth has different messages ("invalid api key",
+            # "unauthorized", …), so the message-shape narrows enough to retry
+            # safely without masking auth failures.
+            is_overloaded_403 = "403" in err and "insufficient permissions" in err_lc
+            # Transient upstream / proxy errors — almost always recover with a
+            # short wait.
+            is_transient_5xx = any(code in err for code in ("502", "503", "504"))
+            is_retryable = is_throttle or is_overloaded_403 or is_transient_5xx
+            if attempt >= max_retries - 1 or not is_retryable:
                 raise
             wait = min(60, 5 * (2 ** attempt))
             logging.warning(
-                "embed throttled (attempt %d/%d), retry in %ds: %s",
+                "embed retryable error (attempt %d/%d), retry in %ds: %s",
                 attempt + 1, max_retries, wait, err[:160].replace("\n", " "),
             )
             await asyncio.sleep(wait)
