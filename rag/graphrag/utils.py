@@ -375,6 +375,48 @@ def chunk_id(chunk):
     return xxhash.xxh64((chunk["content_with_weight"] + chunk["kb_id"]).encode("utf-8")).hexdigest()
 
 
+async def _embed_one_with_retry(embd_mdl, text, *, timeout):
+    """Embed a single string with retry on rate-limit / quota errors.
+
+    The embedding-provider call (OpenAI-compatible / Jina / Ollama / …) can
+    return 429 during a graph rebuild when the per-minute quota gets saturated
+    by parallel entity/relation calls.  The OpenAI SDK has its own 2-retry
+    internal backoff that is often too short; we wrap one more level here with
+    exponential delay (5, 10, 20, 40, 60s capped) up to GRAPHRAG_EMBED_MAX_RETRIES.
+
+    The caller is expected to hold ``embed_limiter`` so that the slot stays
+    occupied during the wait — this naturally lowers concurrency while the
+    provider throttles us.
+
+    Returns the single embedding vector on success, raises on final failure.
+    """
+    max_retries = max(2, int(os.environ.get("GRAPHRAG_EMBED_MAX_RETRIES", 5)))
+    for attempt in range(max_retries):
+        try:
+            ebd, _ = await asyncio.wait_for(
+                thread_pool_exec(embd_mdl.encode, [text]),
+                timeout=timeout,
+            )
+            return ebd[0]
+        except Exception as e:
+            err = str(e)
+            is_throttle = (
+                "429" in err
+                or "rate limit" in err.lower()
+                or "ratelimit" in err.lower()
+                or "quota" in err.lower()
+                or "too many" in err.lower()
+            )
+            if attempt >= max_retries - 1 or not is_throttle:
+                raise
+            wait = min(60, 5 * (2 ** attempt))
+            logging.warning(
+                "embed throttled (attempt %d/%d), retry in %ds: %s",
+                attempt + 1, max_retries, wait, err[:160].replace("\n", " "),
+            )
+            await asyncio.sleep(wait)
+
+
 async def graph_node_to_chunk(kb_id, embd_mdl, ent_name, meta, chunks):
     global chat_limiter
     enable_timeout_assertion = os.environ.get("ENABLE_TIMEOUT_ASSERTION")
@@ -396,11 +438,7 @@ async def graph_node_to_chunk(kb_id, embd_mdl, ent_name, meta, chunks):
     if ebd is None:
         async with embed_limiter:
             timeout = 3 if enable_timeout_assertion else 30000000
-            ebd, _ = await asyncio.wait_for(
-                thread_pool_exec(embd_mdl.encode, [ent_name]),
-                timeout=timeout
-            )
-        ebd = ebd[0]
+            ebd = await _embed_one_with_retry(embd_mdl, ent_name, timeout=timeout)
         set_embed_cache(embd_mdl.llm_name, ent_name, ebd)
     assert ebd is not None
     chunk["q_%d_vec" % len(ebd)] = ebd
@@ -450,14 +488,11 @@ async def graph_edge_to_chunk(kb_id, embd_mdl, from_ent_name, to_ent_name, meta,
     if ebd is None:
         async with embed_limiter:
             timeout = 3 if enable_timeout_assertion else 300000000
-            ebd, _ = await asyncio.wait_for(
-                thread_pool_exec(
-                    embd_mdl.encode,
-                    [txt + f": {meta['description']}"]
-                ),
-                timeout=timeout
+            ebd = await _embed_one_with_retry(
+                embd_mdl,
+                txt + f": {meta['description']}",
+                timeout=timeout,
             )
-        ebd = ebd[0]
         set_embed_cache(embd_mdl.llm_name, txt, ebd)
     assert ebd is not None
     chunk["q_%d_vec" % len(ebd)] = ebd
