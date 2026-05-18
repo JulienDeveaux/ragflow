@@ -38,6 +38,12 @@ GRAPH_FIELD_SEP = "<SEP>"
 ErrorHandlerFn = Callable[[BaseException | None, str | None, dict | None], None]
 
 chat_limiter = asyncio.Semaphore(int(os.environ.get("MAX_CONCURRENT_CHATS", 10)))
+# Separate limiter for embedding calls during graph build.  Embedding providers
+# (Scaleway, OpenAI, Jina, …) generally have a tighter rate-limit budget than
+# chat, so bursting all node/edge embeddings through ``chat_limiter`` (default
+# 10) can saturate the quota and trip 429s during a KG rebuild.  Default 4 ≈
+# safe under Scaleway free-tier RPM caps; tune via env.
+embed_limiter = asyncio.Semaphore(int(os.environ.get("MAX_CONCURRENT_EMBED", 4)))
 
 # Doc-store insert batching for GraphRAG subgraph/node/edge/community_report
 # chunks.  Defaults (64 docs per batch, up to 4 batches in flight) mirror the
@@ -388,7 +394,7 @@ async def graph_node_to_chunk(kb_id, embd_mdl, ent_name, meta, chunks):
     chunk["content_sm_ltks"] = rag_tokenizer.fine_grained_tokenize(chunk["content_ltks"])
     ebd = get_embed_cache(embd_mdl.llm_name, ent_name)
     if ebd is None:
-        async with chat_limiter:
+        async with embed_limiter:
             timeout = 3 if enable_timeout_assertion else 30000000
             ebd, _ = await asyncio.wait_for(
                 thread_pool_exec(embd_mdl.encode, [ent_name]),
@@ -442,7 +448,7 @@ async def graph_edge_to_chunk(kb_id, embd_mdl, from_ent_name, to_ent_name, meta,
     txt = f"{from_ent_name}->{to_ent_name}"
     ebd = get_embed_cache(embd_mdl.llm_name, txt)
     if ebd is None:
-        async with chat_limiter:
+        async with embed_limiter:
             timeout = 3 if enable_timeout_assertion else 300000000
             ebd, _ = await asyncio.wait_for(
                 thread_pool_exec(
