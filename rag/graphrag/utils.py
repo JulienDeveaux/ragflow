@@ -29,6 +29,7 @@ from networkx.readwrite import json_graph
 
 from common.misc_utils import get_uuid
 from common.connection_utils import timeout
+from common.asyncio_utils import LoopLocalSemaphore
 from rag.nlp import rag_tokenizer, search
 from rag.utils.redis_conn import REDIS_CONN
 from common import settings
@@ -38,13 +39,14 @@ GRAPH_FIELD_SEP = "<SEP>"
 
 ErrorHandlerFn = Callable[[BaseException | None, str | None, dict | None], None]
 
-chat_limiter = asyncio.Semaphore(int(os.environ.get("MAX_CONCURRENT_CHATS", 10)))
+chat_limiter = LoopLocalSemaphore(int(os.environ.get("MAX_CONCURRENT_CHATS", 10)))
 # Separate limiter for embedding calls during graph build.  Embedding providers
 # (Scaleway, OpenAI, Jina, …) generally have a tighter rate-limit budget than
 # chat, so bursting all node/edge embeddings through ``chat_limiter`` (default
 # 10) can saturate the quota and trip 429s during a KG rebuild.  Default 4 ≈
-# safe under Scaleway free-tier RPM caps; tune via env.
-embed_limiter = asyncio.Semaphore(int(os.environ.get("MAX_CONCURRENT_EMBED", 4)))
+# safe under Scaleway free-tier RPM caps; tune via env.  LoopLocalSemaphore
+# (per #15100) keeps one semaphore per event loop to avoid cross-loop binding.
+embed_limiter = LoopLocalSemaphore(int(os.environ.get("MAX_CONCURRENT_EMBED", 4)))
 
 # Doc-store insert batching for GraphRAG subgraph/node/edge/community_report
 # chunks.  Defaults (64 docs per batch, up to 4 batches in flight) mirror the
