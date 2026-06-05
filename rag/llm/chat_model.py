@@ -31,7 +31,7 @@ from openai import AsyncOpenAI, OpenAI
 from strenum import StrEnum
 
 from common.misc_utils import thread_pool_exec
-from common.token_utils import num_tokens_from_string, total_token_count_from_response
+from common.token_utils import num_tokens_from_string, total_token_count_from_response, usage_dict_from_response
 from rag.llm import FACTORY_DEFAULT_BASE_URL, LITELLM_PROVIDER_PREFIX, SupportedLiteLLMProvider
 from rag.nlp import is_chinese, is_english
 
@@ -443,7 +443,10 @@ class Base(ABC):
                 history.append({"role": "user", "content": f"Exceed max rounds: {self.max_rounds}"})
                 response, token_count = await self._async_chat(history, gen_conf)
                 ans += response
-                tk_count += token_count
+                # _async_chat now returns a dict {prompt,completion,total} when
+                # the provider exposes the split. Collapse to total for the
+                # tool-loop accumulator; LLMBundle redoes its own normalization.
+                tk_count += token_count.get("total_tokens", 0) if isinstance(token_count, dict) else (token_count or 0)
                 return ans, tk_count
             except Exception as e:
                 e = await self._exceptions_async(e, attempt)
@@ -587,6 +590,14 @@ class Base(ABC):
             final_ans = ""
             tol_token = 0
             async for delta, tol in self._async_chat_streamly(history, gen_conf, with_reasoning=False, **kwargs):
+                # _async_chat_streamly emits a terminal ("__final_usage__", dict)
+                # tuple when the provider returns per-segment usage. Skip the
+                # marker (otherwise the literal string leaks into the answer)
+                # and keep the dict as the final token-count signal — downstream
+                # (LLMBundle.async_chat, dialog_service) is dict-or-int aware.
+                if delta == "__final_usage__":
+                    tol_token = tol
+                    continue
                 if delta.startswith("<think>") or delta.endswith("</think>"):
                     continue
                 final_ans += delta
@@ -610,7 +621,7 @@ class Base(ABC):
         ans = response.choices[0].message.content.strip()
         if response.choices[0].finish_reason == "length":
             ans = self._length_stop(ans)
-        return ans, total_token_count_from_response(response)
+        return ans, usage_dict_from_response(response)
 
     async def async_chat(self, system, history, gen_conf=None, **kwargs):
         gen_conf = dict(gen_conf or {})
@@ -693,7 +704,7 @@ class BaiChuanChat(Base):
                 ans += LENGTH_NOTIFICATION_CN
             else:
                 ans += LENGTH_NOTIFICATION_EN
-        return ans, total_token_count_from_response(response)
+        return ans, usage_dict_from_response(response)
 
     def chat_streamly(self, system, history, gen_conf=None, **kwargs):
         gen_conf = dict(gen_conf or {})
@@ -839,7 +850,7 @@ class MistralChat(Base):
                 ans += LENGTH_NOTIFICATION_CN
             else:
                 ans += LENGTH_NOTIFICATION_EN
-        return ans, total_token_count_from_response(response)
+        return ans, usage_dict_from_response(response)
 
     def chat_streamly(self, system, history, gen_conf=None, **kwargs):
         gen_conf = dict(gen_conf or {})
@@ -989,7 +1000,7 @@ class BaiduYiyanChat(Base):
         system = history[0]["content"] if history and history[0]["role"] == "system" else ""
         response = self.client.do(model=self.model_name, messages=[h for h in history if h["role"] != "system"], system=system, **gen_conf).body
         ans = response["result"]
-        return ans, total_token_count_from_response(response)
+        return ans, usage_dict_from_response(response)
 
     def chat_streamly(self, system, history, gen_conf=None, **kwargs):
         gen_conf = dict(gen_conf or {})
@@ -1427,7 +1438,7 @@ class LiteLLMBase(ABC):
                 if response.choices[0].finish_reason == "length":
                     ans = self._length_stop(ans)
 
-                return ans, total_token_count_from_response(response)
+                return ans, usage_dict_from_response(response)
             except Exception as e:
                 e = await self._exceptions_async(e, attempt)
                 if e:
@@ -1661,7 +1672,10 @@ class LiteLLMBase(ABC):
 
                 response, token_count = await self.async_chat("", history, gen_conf)
                 ans += response
-                tk_count += token_count
+                # async_chat now returns a dict {prompt,completion,total} when
+                # the provider exposes the split. Collapse to total for the
+                # tool-loop accumulator; LLMBundle redoes its own normalization.
+                tk_count += token_count.get("total_tokens", 0) if isinstance(token_count, dict) else (token_count or 0)
                 return ans, tk_count
 
             except Exception as e:

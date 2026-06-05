@@ -34,6 +34,84 @@ def num_tokens_from_string(string: str) -> int:
     except Exception:
         return 0
 
+def usage_dict_from_response(resp):
+    """
+    Extract per-segment token usage from an LLM provider response.
+
+    Returns a dict shaped like the OpenAI usage block:
+    ``{"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}``.
+    Missing segments default to 0 and ``total_tokens`` is back-filled from
+    ``prompt_tokens + completion_tokens`` when the provider only ships the
+    pair. Falls back to ``{"prompt_tokens": 0, "completion_tokens": total,
+    "total_tokens": total}`` when only an aggregate count is available — that
+    preserves billing accuracy at the price of losing the split for providers
+    that don't expose it.
+
+    Always returns a dict; callers can safely ``.get()`` each field.
+    """
+    zero = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    if resp is None:
+        return zero
+
+    def _build(p, c, t):
+        p = int(p or 0)
+        c = int(c or 0)
+        t = int(t or 0) or (p + c)
+        return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": t}
+
+    # OpenAI-compatible: resp.usage.{prompt_tokens, completion_tokens, total_tokens}
+    try:
+        u = getattr(resp, "usage", None)
+        if u is not None and any(
+            hasattr(u, k) for k in ("prompt_tokens", "completion_tokens", "total_tokens")
+        ):
+            d = _build(
+                getattr(u, "prompt_tokens", 0),
+                getattr(u, "completion_tokens", 0),
+                getattr(u, "total_tokens", 0),
+            )
+            if d["total_tokens"]:
+                return d
+    except Exception:
+        pass
+
+    # Anthropic / Bedrock style: resp.usage_metadata.{input_tokens, output_tokens, total_tokens}
+    try:
+        u = getattr(resp, "usage_metadata", None)
+        if u is not None:
+            d = _build(
+                getattr(u, "input_tokens", 0),
+                getattr(u, "output_tokens", 0),
+                getattr(u, "total_tokens", 0),
+            )
+            if d["total_tokens"]:
+                return d
+    except Exception:
+        pass
+
+    # Dict response
+    if isinstance(resp, dict):
+        u = resp.get("usage") or {}
+        d = _build(
+            u.get("prompt_tokens") or u.get("input_tokens"),
+            u.get("completion_tokens") or u.get("output_tokens"),
+            u.get("total_tokens"),
+        )
+        if d["total_tokens"]:
+            return d
+        meta = resp.get("meta") or {}
+        tokens = meta.get("tokens") or {}
+        d = _build(tokens.get("input_tokens"), tokens.get("output_tokens"), None)
+        if d["total_tokens"]:
+            return d
+
+    # Last-resort: re-use the legacy aggregate extractor and assume it's completion.
+    total = total_token_count_from_response(resp)
+    if total:
+        return {"prompt_tokens": 0, "completion_tokens": int(total), "total_tokens": int(total)}
+    return zero
+
+
 def total_token_count_from_response(resp):
     """
     Extract token count from LLM response in various formats.

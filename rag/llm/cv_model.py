@@ -30,7 +30,7 @@ import requests
 from openai import OpenAI, AsyncOpenAI
 from openai.lib.azure import AzureOpenAI, AsyncAzureOpenAI
 
-from common.token_utils import num_tokens_from_string, total_token_count_from_response
+from common.token_utils import num_tokens_from_string, total_token_count_from_response, usage_dict_from_response
 from rag.nlp import is_english
 from rag.prompts.generator import vision_llm_describe_prompt
 
@@ -145,21 +145,40 @@ class Base(ABC):
                 messages=self._form_history(system, history, images),
                 extra_body=self.extra_body,
             )
-            return response.choices[0].message.content.strip(), response.usage.total_tokens
+            return response.choices[0].message.content.strip(), usage_dict_from_response(response)
         except Exception as e:
             return "**ERROR**: " + str(e), 0
 
     async def async_chat_streamly(self, system, history, gen_conf, images=None, **kwargs):
         ans = ""
         tk_count = 0
+        # Mirror chat_model.Base._async_chat_streamly: request per-segment usage
+        # in the final chunk so downstream consumers (LLMBundle, dialog_service)
+        # can attribute prompt vs completion tokens instead of collapsing to a
+        # single int.
+        final_usage = None
         try:
             response = await self.async_client.chat.completions.create(
                 model=self.model_name,
                 messages=self._form_history(system, history, images),
                 stream=True,
+                stream_options={"include_usage": True},
                 extra_body=self.extra_body,
             )
             async for resp in response:
+                # The terminal include_usage chunk arrives with no choices and
+                # only the `usage` attribute populated.
+                if hasattr(resp, "usage") and resp.usage:
+                    try:
+                        final_usage = {
+                            "prompt_tokens": getattr(resp.usage, "prompt_tokens", 0) or 0,
+                            "completion_tokens": getattr(resp.usage, "completion_tokens", 0) or 0,
+                            "total_tokens": getattr(resp.usage, "total_tokens", 0) or 0,
+                        }
+                    except Exception:
+                        pass
+                if not resp.choices:
+                    continue
                 if not resp.choices[0].delta.content:
                     continue
                 delta = resp.choices[0].delta.content
@@ -167,12 +186,19 @@ class Base(ABC):
                 if resp.choices[0].finish_reason == "length":
                     ans += "...\nFor the content length reason, it stopped, continue?" if is_english([ans]) else "······\n由于长度的原因，回答被截断了，要继续吗？"
                 if resp.choices[0].finish_reason == "stop":
-                    tk_count += resp.usage.total_tokens
+                    # Best-effort fallback when the provider didn't send a
+                    # dedicated usage chunk (some image2text endpoints inline
+                    # usage on the last delta).
+                    if resp.usage and final_usage is None:
+                        tk_count += resp.usage.total_tokens
                 yield ans
         except Exception as e:
             yield ans + "\n**ERROR**: " + str(e)
 
-        yield tk_count
+        # Preserve dict shape when the provider gave us the split, fall back to
+        # the legacy int total otherwise — both are consumed by
+        # LLMBundle.async_chat_streamly_delta.
+        yield final_usage if final_usage else tk_count
 
     @staticmethod
     def image2base64_rawvalue(self, image):
@@ -265,7 +291,7 @@ class GptV4(Base):
             messages=self.prompt(b64),
             extra_body=self.extra_body
         )
-        return res.choices[0].message.content.strip(), total_token_count_from_response(res)
+        return res.choices[0].message.content.strip(), usage_dict_from_response(res)
 
     def describe_with_prompt(self, image, prompt=None):
         b64 = self.image2base64(image)
@@ -274,7 +300,7 @@ class GptV4(Base):
             messages=self.vision_llm_prompt(b64, prompt),
             extra_body=self.extra_body,
         )
-        return res.choices[0].message.content.strip(), total_token_count_from_response(res)
+        return res.choices[0].message.content.strip(), usage_dict_from_response(res)
 
 
 class AzureGptV4(GptV4):
@@ -461,7 +487,7 @@ class Zhipu4V(GptV4):
         content = response.choices[0].message.content.strip()
 
         cleaned = re.sub(r"<\|(begin_of_box|end_of_box)\|>", "", content).strip()
-        return cleaned, total_token_count_from_response(response)
+        return cleaned, usage_dict_from_response(response)
 
     async def async_chat_streamly(self, system, history, gen_conf, images=None, **kwargs):
         from rag.llm.chat_model import LENGTH_NOTIFICATION_CN, LENGTH_NOTIFICATION_EN
@@ -873,7 +899,7 @@ class GeminiCV(Base):
             model=self.model_name,
             contents=contents,
         )
-        return res.text, total_token_count_from_response(res)
+        return res.text, usage_dict_from_response(res)
 
     def describe_with_prompt(self, image, prompt=None):
         from google.genai import types
@@ -894,7 +920,7 @@ class GeminiCV(Base):
             model=self.model_name,
             contents=contents,
         )
-        return res.text, total_token_count_from_response(res)
+        return res.text, usage_dict_from_response(res)
 
     async def async_chat(self, system, history, gen_conf, images=None, video_bytes=None, filename="", **kwargs):
         if video_bytes:
@@ -925,7 +951,7 @@ class GeminiCV(Base):
             )
             ans = response.text
             logging.info("[GeminiCV] async_chat completed")
-            return ans, total_token_count_from_response(response)
+            return ans, usage_dict_from_response(response)
         except Exception as e:
             logging.warning(f"[GeminiCV] async_chat error: {e}")
             return "**ERROR**: " + str(e), 0
@@ -1056,12 +1082,12 @@ class NvidiaCV(Base):
         b64 = self.image2base64(image)
         vision_prompt = self.vision_llm_prompt(b64, prompt) if prompt else self.vision_llm_prompt(b64)
         response = self._request(vision_prompt)
-        return (response["choices"][0]["message"]["content"].strip(), total_token_count_from_response(response))
+        return (response["choices"][0]["message"]["content"].strip(), usage_dict_from_response(response))
 
     async def async_chat(self, system, history, gen_conf, images=None, **kwargs):
         try:
             response = await thread_pool_exec(self._request, self._form_history(system, history, images), gen_conf)
-            return (response["choices"][0]["message"]["content"].strip(), total_token_count_from_response(response))
+            return (response["choices"][0]["message"]["content"].strip(), usage_dict_from_response(response))
         except Exception as e:
             return "**ERROR**: " + str(e), 0
 
@@ -1121,7 +1147,7 @@ class AnthropicCV(Base):
         prompt = self.prompt(b64, prompt if prompt else vision_llm_describe_prompt())
 
         response = self.client.messages.create(model=self.model_name, max_tokens=self.max_tokens, messages=prompt)
-        return response["content"][0]["text"].strip(), total_token_count_from_response(response)
+        return response["content"][0]["text"].strip(), usage_dict_from_response(response)
 
     def _clean_conf(self, gen_conf):
         if "presence_penalty" in gen_conf:
@@ -1339,7 +1365,7 @@ class BedrockCV(Base):
             messages=messages,
             **self._get_aws_creds(),
         )
-        return res.choices[0].message.content.strip(), total_token_count_from_response(res)
+        return res.choices[0].message.content.strip(), usage_dict_from_response(res)
 
     def describe(self, image):
         return self.describe_with_prompt(image)

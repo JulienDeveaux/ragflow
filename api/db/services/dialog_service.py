@@ -319,11 +319,21 @@ async def async_chat_solo(dialog, messages, stream=True):
         logging.debug("User: {}|Assistant: {}".format(user_content, answer))
         response = {"answer": answer, "reference": {}, "audio_binary": tts(tts_mdl, answer), "prompt": "", "created_at": time.time()}
         if used_tokens:
-            response["usage"] = {
-                "prompt_tokens": 0,
-                "completion_tokens": used_tokens,
-                "total_tokens": used_tokens
-            }
+            # async_chat now returns a usage dict (prompt+completion+total) when
+            # the provider exposes the split; legacy integer counts still flow
+            # through the else branch.
+            if isinstance(used_tokens, dict):
+                response["usage"] = {
+                    "prompt_tokens": used_tokens.get("prompt_tokens", 0),
+                    "completion_tokens": used_tokens.get("completion_tokens", 0),
+                    "total_tokens": used_tokens.get("total_tokens", 0),
+                }
+            else:
+                response["usage"] = {
+                    "prompt_tokens": 0,
+                    "completion_tokens": used_tokens,
+                    "total_tokens": used_tokens,
+                }
         yield response
 
 
@@ -893,11 +903,21 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
         res = decorate_answer(answer)
         res["audio_binary"] = tts(tts_mdl, answer)
         if used_tokens:
-            res["usage"] = {
-                "prompt_tokens": 0,  # Not separately available
-                "completion_tokens": used_tokens,
-                "total_tokens": used_tokens
-            }
+            # async_chat now returns a usage dict (prompt+completion+total) when
+            # the provider exposes the split; legacy integer counts still flow
+            # through the else branch.
+            if isinstance(used_tokens, dict):
+                res["usage"] = {
+                    "prompt_tokens": used_tokens.get("prompt_tokens", 0),
+                    "completion_tokens": used_tokens.get("completion_tokens", 0),
+                    "total_tokens": used_tokens.get("total_tokens", 0),
+                }
+            else:
+                res["usage"] = {
+                    "prompt_tokens": 0,
+                    "completion_tokens": used_tokens,
+                    "total_tokens": used_tokens,
+                }
         yield res
 
     return

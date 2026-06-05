@@ -394,14 +394,20 @@ class LLMBundle(LLM4Tenant):
         if not self.verbose_tool_use:
             txt = re.sub(r"<tool_call>.*?</tool_call>", "", txt, flags=re.DOTALL)
 
-        if used_tokens:
+        # Underlying model now returns either a dict {prompt,completion,total}
+        # when the provider exposes the split, or a legacy int total. Normalize
+        # to an int for accumulation/billing, then propagate the original
+        # shape so dialog_service can attribute prompt/completion separately.
+        billable_tokens = used_tokens.get("total_tokens", 0) if isinstance(used_tokens, dict) else (used_tokens or 0)
+
+        if billable_tokens:
             # Safe: single-threaded asyncio event loop, += not interrupted between awaits
-            self.cumulated_tokens += used_tokens
-            if not TenantLLMService.increase_usage_by_id(self.model_config["id"], used_tokens):
-                logging.error("LLMBundle.async_chat can't update token usage for {}/CHAT llm_name: {}, used_tokens: {}".format(self.tenant_id, self.model_config["llm_name"], used_tokens))
+            self.cumulated_tokens += billable_tokens
+            if not TenantLLMService.increase_usage_by_id(self.model_config["id"], billable_tokens):
+                logging.error("LLMBundle.async_chat can't update token usage for {}/CHAT llm_name: {}, used_tokens: {}".format(self.tenant_id, self.model_config["llm_name"], billable_tokens))
 
         if generation:
-            generation.update(output={"output": txt}, usage_details={"total_tokens": used_tokens})
+            generation.update(output={"output": txt}, usage_details={"total_tokens": billable_tokens})
             generation.end()
 
         return txt, used_tokens
