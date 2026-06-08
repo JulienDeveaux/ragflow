@@ -417,8 +417,10 @@ async def _embed_one_with_retry(embd_mdl, text, *, timeout):
             # safely without masking auth failures.
             is_overloaded_403 = "403" in err and "insufficient permissions" in err_lc
             # Transient upstream / proxy errors — almost always recover with a
-            # short wait.
-            is_transient_5xx = any(code in err for code in ("502", "503", "504"))
+            # short wait.  Match any 5xx via the OpenAI SDK's ``Error code: NNN``
+            # boilerplate (covers 500 INTERNAL_SERVER_ERROR, 502 BAD_GATEWAY,
+            # 503 SERVICE_UNAVAILABLE, 504 GATEWAY_TIMEOUT, 529 OVERLOADED…).
+            is_transient_5xx = bool(re.search(r"Error code: 5\d{2}", err))
             is_retryable = is_throttle or is_overloaded_403 or is_transient_5xx
             if attempt >= max_retries - 1 or not is_retryable:
                 raise

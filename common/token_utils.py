@@ -34,6 +34,40 @@ def num_tokens_from_string(string: str) -> int:
     except Exception:
         return 0
 
+def _coerce_token_details(value):
+    """
+    Normalize a ``prompt_tokens_details`` / ``completion_tokens_details`` payload
+    (OpenAI / Mistral / DeepSeek expose ``cached_tokens``, ``reasoning_tokens``,
+    ``audio_tokens``, ``accepted_prediction_tokens``, ...) into a plain dict of
+    numeric values.
+
+    Accepts either a Pydantic model (OpenAI SDK) or a plain dict. Returns ``{}``
+    when no useful data is present so callers can ``.update()`` unconditionally.
+    """
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        items = value.items()
+    elif hasattr(value, "model_dump"):
+        try:
+            items = value.model_dump(exclude_none=True).items()
+        except Exception:
+            return {}
+    else:
+        # OpenAI SDK pre-v1 / arbitrary object: pull its public numeric attrs.
+        try:
+            items = ((k, getattr(value, k)) for k in dir(value)
+                     if not k.startswith("_") and not callable(getattr(value, k, None)))
+        except Exception:
+            return {}
+    out = {}
+    for k, v in items:
+        # Reject bool — Python's isinstance(True, int) gotcha would pollute traces.
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            out[k] = v
+    return out
+
+
 def usage_dict_from_response(resp):
     """
     Extract per-segment token usage from an LLM provider response.
@@ -47,6 +81,11 @@ def usage_dict_from_response(resp):
     preserves billing accuracy at the price of losing the split for providers
     that don't expose it.
 
+    When the provider also exposes ``prompt_tokens_details`` /
+    ``completion_tokens_details`` (OpenAI ``gpt-4o`` cached_tokens, ``o1``
+    reasoning_tokens, ...), those sub-dicts are propagated under the same
+    keys so downstream consumers (Langfuse trace UI) can show the breakdown.
+
     Always returns a dict; callers can safely ``.get()`` each field.
     """
     zero = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -58,6 +97,15 @@ def usage_dict_from_response(resp):
         c = int(c or 0)
         t = int(t or 0) or (p + c)
         return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": t}
+
+    def _attach_details(d, prompt_details, completion_details):
+        pd = _coerce_token_details(prompt_details)
+        cd = _coerce_token_details(completion_details)
+        if pd:
+            d["prompt_tokens_details"] = pd
+        if cd:
+            d["completion_tokens_details"] = cd
+        return d
 
     # OpenAI-compatible: resp.usage.{prompt_tokens, completion_tokens, total_tokens}
     try:
@@ -71,7 +119,11 @@ def usage_dict_from_response(resp):
                 getattr(u, "total_tokens", 0),
             )
             if d["total_tokens"]:
-                return d
+                return _attach_details(
+                    d,
+                    getattr(u, "prompt_tokens_details", None),
+                    getattr(u, "completion_tokens_details", None),
+                )
     except Exception:
         pass
 
@@ -98,7 +150,11 @@ def usage_dict_from_response(resp):
             u.get("total_tokens"),
         )
         if d["total_tokens"]:
-            return d
+            return _attach_details(
+                d,
+                u.get("prompt_tokens_details"),
+                u.get("completion_tokens_details"),
+            )
         meta = resp.get("meta") or {}
         tokens = meta.get("tokens") or {}
         d = _build(tokens.get("input_tokens"), tokens.get("output_tokens"), None)

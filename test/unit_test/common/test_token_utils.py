@@ -14,7 +14,7 @@
 #  limitations under the License.
 #
 
-from common.token_utils import num_tokens_from_string, total_token_count_from_response, truncate, encoder
+from common.token_utils import num_tokens_from_string, total_token_count_from_response, truncate, encoder, usage_dict_from_response
 import pytest
 
 
@@ -371,3 +371,84 @@ class TestTruncate:
 
         result = truncate(number_string, max_len)
         assert len(encoder.encode(result)) == max_len
+
+
+class _Usage:
+    """Tiny stub for OpenAI SDK CompletionUsage attribute access."""
+
+    def __init__(self, **kw):
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+
+class _Resp:
+    def __init__(self, usage):
+        self.usage = usage
+
+
+class TestUsageDictFromResponse:
+    """
+    Pin the prompt/completion split + provider sub-detail propagation that the
+    rest of the token-usage chain (chat_model -> llm_service -> Langfuse) relies
+    on. These shapes are part of the public contract — providers that newly
+    expose ``prompt_tokens_details`` (OpenAI cached_tokens, o1 reasoning_tokens)
+    must flow through to Langfuse without source-side changes.
+    """
+
+    def test_none_response_returns_zero_dict(self):
+        assert usage_dict_from_response(None) == {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+
+    def test_openai_object_usage_with_details_propagates(self):
+        usage = _Usage(
+            prompt_tokens=100,
+            completion_tokens=50,
+            total_tokens=150,
+            prompt_tokens_details=_Usage(cached_tokens=80, audio_tokens=0),
+            completion_tokens_details=_Usage(reasoning_tokens=20),
+        )
+        d = usage_dict_from_response(_Resp(usage))
+        assert d["prompt_tokens"] == 100
+        assert d["completion_tokens"] == 50
+        assert d["total_tokens"] == 150
+        assert d["prompt_tokens_details"] == {"cached_tokens": 80, "audio_tokens": 0}
+        assert d["completion_tokens_details"] == {"reasoning_tokens": 20}
+
+    def test_dict_response_with_details_propagates(self):
+        resp = {
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "prompt_tokens_details": {"cached_tokens": 7},
+                "completion_tokens_details": {"reasoning_tokens": 3},
+            }
+        }
+        d = usage_dict_from_response(resp)
+        assert d["prompt_tokens_details"] == {"cached_tokens": 7}
+        assert d["completion_tokens_details"] == {"reasoning_tokens": 3}
+
+    def test_response_without_details_omits_detail_keys(self):
+        # No details on the wire → no details keys in the result. Callers that
+        # ``.get("prompt_tokens_details", {})`` must not see a noise dict.
+        d = usage_dict_from_response(_Resp(_Usage(
+            prompt_tokens=10, completion_tokens=5, total_tokens=15,
+        )))
+        assert "prompt_tokens_details" not in d
+        assert "completion_tokens_details" not in d
+
+    def test_bool_values_in_details_are_dropped(self):
+        # Python's isinstance(True, int) gotcha — a stray boolean in a provider
+        # response must not pollute the trace.
+        d = usage_dict_from_response({
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "prompt_tokens_details": {"cached_tokens": 7, "weird_flag": True},
+            }
+        })
+        assert d["prompt_tokens_details"] == {"cached_tokens": 7}

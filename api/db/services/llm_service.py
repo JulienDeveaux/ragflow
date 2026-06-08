@@ -29,6 +29,37 @@ from common.constants import LLMType
 from common.token_utils import num_tokens_from_string
 
 
+_TOKEN_DETAIL_KEYS = ("prompt_tokens_details", "completion_tokens_details")
+
+
+def _flatten_token_details(usage: dict) -> dict:
+    """
+    Extract ``prompt_tokens_details`` / ``completion_tokens_details`` sub-dicts
+    from an OpenAI-style usage object into flat ``{prefix}_{key}`` numeric pairs
+    Langfuse can render as separate cost lines.
+
+    Examples (OpenAI ``gpt-4o``):
+
+    >>> _flatten_token_details({
+    ...     "prompt_tokens_details": {"cached_tokens": 100, "audio_tokens": 0},
+    ...     "completion_tokens_details": {"reasoning_tokens": 42},
+    ... })
+    {'input_cached_tokens': 100, 'input_audio_tokens': 0, 'output_reasoning_tokens': 42}
+
+    Non-numeric values and unknown shapes are dropped silently — these sub-dicts
+    are advisory; we never want a provider quirk to fail a trace update.
+    """
+    out: dict = {}
+    for key, prefix in zip(_TOKEN_DETAIL_KEYS, ("input", "output")):
+        sub = usage.get(key)
+        if not isinstance(sub, dict):
+            continue
+        for sub_key, sub_val in sub.items():
+            if isinstance(sub_val, (int, float)) and not isinstance(sub_val, bool):
+                out[f"{prefix}_{sub_key}"] = sub_val
+    return out
+
+
 class LLMService(CommonService):
     model = LLM
 
@@ -407,7 +438,24 @@ class LLMBundle(LLM4Tenant):
                 logging.error("LLMBundle.async_chat can't update token usage for {}/CHAT llm_name: {}, used_tokens: {}".format(self.tenant_id, self.model_config["llm_name"], billable_tokens))
 
         if generation:
-            generation.update(output={"output": txt}, usage_details={"total_tokens": billable_tokens})
+            # Forward the prompt/completion split to Langfuse when the
+            # provider exposed it, so the trace UI shows real input/output
+            # token breakdown instead of just a total. When the provider
+            # also returns ``prompt_tokens_details`` / ``completion_tokens_details``
+            # (OpenAI / Mistral / DeepSeek surface cached_tokens,
+            # reasoning_tokens, audio_tokens, ...), flatten those into the
+            # same dict — Langfuse accepts arbitrary numeric keys under
+            # ``usage_details`` and renders them in the trace UI.
+            if isinstance(used_tokens, dict):
+                usage_details = {
+                    "input": used_tokens.get("prompt_tokens", 0),
+                    "output": used_tokens.get("completion_tokens", 0),
+                    "total": used_tokens.get("total_tokens", billable_tokens),
+                }
+                usage_details.update(_flatten_token_details(used_tokens))
+            else:
+                usage_details = {"total_tokens": billable_tokens}
+            generation.update(output={"output": txt}, usage_details=usage_details)
             generation.end()
 
         return txt, used_tokens
@@ -517,7 +565,21 @@ class LLMBundle(LLM4Tenant):
                 if not TenantLLMService.increase_usage_by_id(self.model_config["id"], total_tokens):
                     logging.error("LLMBundle.async_chat_streamly_delta can't update token usage for {}/CHAT llm_name: {}, used_tokens: {}".format(self.tenant_id, self.model_config["llm_name"], total_tokens))
             if generation:
-                generation.update(output={"output": ans}, usage_details={"total_tokens": total_tokens})
+                # Forward the prompt/completion split to Langfuse when present
+                # so trace UI shows input/output breakdown not just a total.
+                # Also flatten ``*_tokens_details`` sub-dicts (cached_tokens,
+                # reasoning_tokens, audio_tokens, ...) — same rationale as in
+                # ``async_chat``.
+                if isinstance(usage_data, dict):
+                    langfuse_usage = {
+                        "input": usage_data.get("prompt_tokens", 0),
+                        "output": usage_data.get("completion_tokens", 0),
+                        "total": usage_data.get("total_tokens", total_tokens),
+                    }
+                    langfuse_usage.update(_flatten_token_details(usage_data))
+                else:
+                    langfuse_usage = {"total_tokens": total_tokens}
+                generation.update(output={"output": ans}, usage_details=langfuse_usage)
                 generation.end()
             # Yield token usage at the end as a tuple marker (preserves dict or int)
             yield ("token_usage", usage_data)
