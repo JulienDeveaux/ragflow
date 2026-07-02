@@ -536,6 +536,37 @@ def get_data_openai(id=None, created=None, model=None, prompt_tokens=0, completi
     }
 
 
+def get_data_openai_usage_chunk(id=None, model=None, usage=None):
+    """Build an OpenAI ``stream_options.include_usage``-style terminal chunk.
+
+    OpenAI streams a final ``chat.completion.chunk`` with an empty ``choices``
+    array and a populated ``usage`` object when usage reporting is requested.
+    The agent OpenAI-compatible streaming path emits this once, right before
+    ``[DONE]``, so clients can read real token usage from the stream (the
+    regular per-token chunks never carry ``usage``).
+    """
+    usage = usage or {}
+    prompt_tokens = usage.get("prompt_tokens", 0) or 0
+    completion_tokens = usage.get("completion_tokens", 0) or 0
+    total_tokens = usage.get("total_tokens", 0) or (prompt_tokens + completion_tokens)
+    return {
+        "id": f"{id}",
+        "object": "chat.completion.chunk",
+        "model": model,
+        "choices": [],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "accepted_prediction_tokens": 0,
+                "rejected_prediction_tokens": 0,
+            },
+        },
+    }
+
+
 def check_duplicate_ids(ids, id_type="item"):
     """
     Check for duplicate IDs in a list and return unique IDs and error messages.

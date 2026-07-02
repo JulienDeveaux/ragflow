@@ -656,6 +656,7 @@ class Canvas(Graph):
                            "outputs": self.get_component_obj(self.path[-1]).output(),
                            "elapsed_time": time.perf_counter() - st,
                            "created_at": st,
+                           "usage": self.get_token_usage(),
                        })
             self.history.append(("assistant", self.get_component_obj(self.path[-1]).output()))
             self.globals["sys.history"].append(f"{self.history[-1][0]}: {self.history[-1][1]}")
@@ -843,6 +844,46 @@ class Canvas(Graph):
         if self._has_reference():
             message_end["reference"] = self.get_reference()
         return message_end
+
+    def get_token_usage(self) -> dict:
+        """Aggregate real provider token usage across this run.
+
+        Chat-model bundles are summed from two places on each top-level
+        component: ``chat_mdl`` (LLM, Agent, Categorize) and ``aux_chat_bundles``
+        (chat bundles a component creates for internal steps — e.g. Retrieval's
+        metadata filter, TOC enhance and KG query analysis). A fresh Canvas —
+        hence fresh bundles starting at 0 — is built per completion, so summing
+        across all components yields this run's usage. Returns an OpenAI-shaped
+        ``{prompt_tokens, completion_tokens, total_tokens}``; ``total_tokens``
+        is reconciled to the authoritative billable sum.
+
+        Known exclusions (billed via ``increase_usage_by_id`` but not reported
+        here): embedding/rerank token counts (different model class), the
+        ``cross_languages`` helper's internal bundle, and sub-Agents loaded as
+        another Agent's *tool* (they live under the parent's ``tools``, not in
+        ``components``). Multi-agent templates that need exact aggregate
+        reporting must extend this to walk nested tool agents.
+        """
+        prompt = completion = billable = 0
+        for cpn in self.components.values():
+            obj = cpn.get("obj") if isinstance(cpn, dict) else None
+            if obj is None:
+                continue
+            bundles = []
+            main_bundle = getattr(obj, "chat_mdl", None)
+            if main_bundle is not None:
+                bundles.append(main_bundle)
+            bundles.extend(getattr(obj, "aux_chat_bundles", None) or [])
+            for bundle in bundles:
+                billable += getattr(bundle, "cumulated_tokens", 0) or 0
+                prompt += getattr(bundle, "cumulated_prompt_tokens", 0) or 0
+                completion += getattr(bundle, "cumulated_completion_tokens", 0) or 0
+        # Keep total authoritative (billable sum) and the split consistent:
+        # any total not attributed to the split is folded into completion.
+        total = max(billable, prompt + completion)
+        if total > prompt + completion:
+            completion += total - (prompt + completion)
+        return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
 
     def add_memory(self, user:str, assist:str, summ: str):
         self.memory.append((user, assist, summ))

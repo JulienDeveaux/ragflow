@@ -92,6 +92,12 @@ class Retrieval(ToolBase, ABC):
         return self._param.dataset_ids or getattr(self._param, "kb_ids", None) or []
 
     async def _retrieve_kb(self, query_text: str):
+        # Chat-model bundles created for internal retrieval steps (metadata
+        # filter, TOC enhance, KG query analysis). Kept on ``self`` so
+        # Canvas.get_token_usage() can include their real provider tokens in
+        # the run's reported usage — they are billed anyway; without this they
+        # were silently missing from the aggregate.
+        self.aux_chat_bundles = []
         kb_ids: list[str] = []
         for id in self._dataset_ids:
             if id.find("@") < 0:
@@ -175,6 +181,7 @@ class Retrieval(ToolBase, ABC):
                 tenant_id = self._canvas.get_tenant_id()
                 chat_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.CHAT)
                 chat_mdl = LLMBundle(tenant_id, chat_model_config)
+                self.aux_chat_bundles.append(chat_mdl)
 
             doc_ids = await apply_meta_data_filter(
                 self._param.meta_data_filter,
@@ -213,6 +220,7 @@ class Retrieval(ToolBase, ABC):
                 tenant_id = self._canvas._tenant_id
                 chat_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.CHAT)
                 chat_mdl = LLMBundle(tenant_id, chat_model_config)
+                self.aux_chat_bundles.append(chat_mdl)
                 cks = await settings.retriever.retrieval_by_toc(query, kbinfos["chunks"], [kb.tenant_id for kb in kbs],
                                                           chat_mdl, self._param.top_n)
                 if self.check_if_canceled("Retrieval processing"):
@@ -224,11 +232,13 @@ class Retrieval(ToolBase, ABC):
             if self._param.use_kg:
                 tenant_id = self._canvas.get_tenant_id()
                 chat_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.CHAT)
+                kg_chat_mdl = LLMBundle(tenant_id, chat_model_config)
+                self.aux_chat_bundles.append(kg_chat_mdl)
                 ck = await settings.kg_retriever.retrieval(query,
                                                      [kb.tenant_id for kb in kbs],
                                                      kb_ids,
                                                      embd_mdl,
-                                                     LLMBundle(tenant_id, chat_model_config))
+                                                     kg_chat_mdl)
                 if self.check_if_canceled("Retrieval processing"):
                     return
                 if ck["content_with_weight"]:
@@ -238,8 +248,10 @@ class Retrieval(ToolBase, ABC):
 
         if self._param.use_kg and kbs:
             chat_model_config = get_tenant_default_model_by_type(kbs[0].tenant_id, LLMType.CHAT)
+            kg_chat_mdl = LLMBundle(kbs[0].tenant_id, chat_model_config)
+            self.aux_chat_bundles.append(kg_chat_mdl)
             ck = await settings.kg_retriever.retrieval(query, [kb.tenant_id for kb in kbs], filtered_kb_ids, embd_mdl,
-                                                 LLMBundle(kbs[0].tenant_id, chat_model_config))
+                                                 kg_chat_mdl)
             if self.check_if_canceled("Retrieval processing"):
                 return
             if ck["content_with_weight"]:

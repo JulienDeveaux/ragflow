@@ -124,7 +124,11 @@ class Categorize(LLM, ABC):
         self.set_input_value(query_key, msg[-1]["content"])
         self._param.update_prompt()
         chat_model_config = get_model_config_by_type_and_name(self._canvas.get_tenant_id(), LLMType.CHAT, self._param.llm_id)
-        chat_mdl = LLMBundle(self._canvas.get_tenant_id(), chat_model_config)
+        # Assign to self.chat_mdl (not a throwaway local) so Canvas.get_token_usage
+        # — which sums each component's self.chat_mdl.cumulated_* — counts the
+        # routing classification's real provider tokens. Otherwise the Categorize
+        # call's tokens are silently dropped from the run's reported usage.
+        self.chat_mdl = LLMBundle(self._canvas.get_tenant_id(), chat_model_config)
 
         user_prompt = """
 ---- Real Data ----
@@ -134,7 +138,7 @@ class Categorize(LLM, ABC):
         if self.check_if_canceled("Categorize processing"):
             return
 
-        ans, _ = await chat_mdl.async_chat(self._param.sys_prompt, [{"role": "user", "content": user_prompt}], self._param.gen_conf())
+        ans, _ = await self.chat_mdl.async_chat(self._param.sys_prompt, [{"role": "user", "content": user_prompt}], self._param.gen_conf())
         logging.info(f"input: {user_prompt}, answer: {str(ans)}")
         if ERROR_PREFIX in ans:
             raise Exception(ans)

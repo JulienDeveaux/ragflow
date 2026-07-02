@@ -117,6 +117,14 @@ class LLMBundle(LLM4Tenant):
     def __init__(self, tenant_id: str, model_config: dict, lang="Chinese", **kwargs):
         super().__init__(tenant_id, model_config, lang, **kwargs)
         self.cumulated_tokens = 0
+        # Real provider prompt/completion split, accumulated across every chat
+        # call this bundle makes. Only populated when the provider exposes the
+        # split (``used_tokens`` is a dict); int-only providers leave these at 0
+        # and callers fall back to attributing the whole total to completion.
+        # The agent canvas sums these across all its LLM components to report
+        # the run's true token usage on the OpenAI-compatible endpoint.
+        self.cumulated_prompt_tokens = 0
+        self.cumulated_completion_tokens = 0
 
     def bind_tools(self, toolcall_session, tools):
         if not self.is_tools:
@@ -398,6 +406,20 @@ class LLMBundle(LLM4Tenant):
         threading.Thread(target=worker, daemon=True).start()
         return queue
 
+    def _accumulate_token_split(self, used_tokens, billable_tokens):
+        """Accumulate the provider's prompt/completion split across chat calls.
+
+        ``used_tokens`` is ``{prompt_tokens, completion_tokens, total_tokens}``
+        when the provider exposes the split, otherwise a legacy int total. With
+        only a total we attribute it to completion (prompt is unknown), keeping
+        the aggregate correct — same fallback shape as ``usage_dict_from_response``.
+        """
+        if isinstance(used_tokens, dict):
+            self.cumulated_prompt_tokens += used_tokens.get("prompt_tokens", 0) or 0
+            self.cumulated_completion_tokens += used_tokens.get("completion_tokens", 0) or 0
+        else:
+            self.cumulated_completion_tokens += billable_tokens or 0
+
     async def async_chat(self, system: str, history: list, gen_conf: dict = {}, **kwargs):
         if self.is_tools and getattr(self.mdl, "is_tools", False) and hasattr(self.mdl, "async_chat_with_tools"):
             base_fn = self.mdl.async_chat_with_tools
@@ -434,6 +456,7 @@ class LLMBundle(LLM4Tenant):
         if billable_tokens:
             # Safe: single-threaded asyncio event loop, += not interrupted between awaits
             self.cumulated_tokens += billable_tokens
+            self._accumulate_token_split(used_tokens, billable_tokens)
             if not TenantLLMService.increase_usage_by_id(self.model_config["id"], billable_tokens):
                 logging.error("LLMBundle.async_chat can't update token usage for {}/CHAT llm_name: {}, used_tokens: {}".format(self.tenant_id, self.model_config["llm_name"], billable_tokens))
 
@@ -480,12 +503,14 @@ class LLMBundle(LLM4Tenant):
         if stream_fn:
             chat_partial = partial(stream_fn, system, history, gen_conf)
             use_kwargs = self._clean_param(chat_partial, **kwargs)
+            usage_split = None  # provider dict {prompt,completion,total} when exposed
             try:
                 async for txt in chat_partial(**use_kwargs):
                     # Final token usage (API-provided dict) is collapsed to its total
                     # so existing consumers that only know about int sentinels still work.
                     if isinstance(txt, dict) and "total_tokens" in txt:
                         total_tokens = txt.get("total_tokens", 0) or 0
+                        usage_split = txt
                         break
                     if isinstance(txt, int):
                         total_tokens = txt
@@ -506,6 +531,7 @@ class LLMBundle(LLM4Tenant):
                 raise
             if total_tokens:
                 self.cumulated_tokens += total_tokens
+                self._accumulate_token_split(usage_split if usage_split is not None else total_tokens, total_tokens)
                 if not TenantLLMService.increase_usage_by_id(self.model_config["id"], total_tokens):
                     logging.error("LLMBundle.async_chat_streamly can't update token usage for {}/CHAT llm_name: {}, used_tokens: {}".format(self.tenant_id, self.model_config["llm_name"], total_tokens))
             if generation:
@@ -562,6 +588,7 @@ class LLMBundle(LLM4Tenant):
 
             if total_tokens:
                 self.cumulated_tokens += total_tokens
+                self._accumulate_token_split(usage_data if isinstance(usage_data, dict) else total_tokens, total_tokens)
                 if not TenantLLMService.increase_usage_by_id(self.model_config["id"], total_tokens):
                     logging.error("LLMBundle.async_chat_streamly_delta can't update token usage for {}/CHAT llm_name: {}, used_tokens: {}".format(self.tenant_id, self.model_config["llm_name"], total_tokens))
             if generation:

@@ -24,7 +24,7 @@ from api.db.services.api_service import API4ConversationService
 from api.db.services.common_service import CommonService
 from api.db.services.user_canvas_version import UserCanvasVersionService
 from common.misc_utils import get_uuid, thread_pool_exec
-from api.utils.api_utils import get_data_openai
+from api.utils.api_utils import get_data_openai, get_data_openai_usage_chunk
 import tiktoken
 from peewee import fn
 
@@ -295,9 +295,16 @@ async def completion_openai(tenant_id, agent_id, question, session_id=None, stre
     tiktoken_encoder = tiktoken.get_encoding("cl100k_base")
     prompt_tokens = len(tiktoken_encoder.encode(str(question)))
     user_id = kwargs.get("user_id", "")
+    # When the caller omits session_id, ``completion`` mints a new one and tags
+    # every event with it via ``ans["session_id"]``. We must echo THAT id back as
+    # the OpenAI ``id`` (instead of a throwaway uuid4) so the client can resume
+    # the conversation on the next turn — otherwise multi-turn breaks with
+    # "Session not found!".
+    resolved_session_id = session_id
 
     if stream:
         completion_tokens = 0
+        real_usage = None  # real provider usage from the canvas run (workflow_finished)
         try:
             async for ans in completion(
                 tenant_id=tenant_id,
@@ -313,6 +320,15 @@ async def completion_openai(tenant_id, agent_id, question, session_id=None, stre
                     except Exception as e:
                         logging.exception(f"Agent OpenAI-Compatible completion_openai parse answer failed: {e}")
                         continue
+                if ans.get("session_id"):
+                    resolved_session_id = ans["session_id"]
+                # The canvas emits a single terminal ``workflow_finished`` event
+                # carrying the run's aggregated real provider token usage. Capture
+                # it so we can ship an OpenAI ``include_usage``-style final chunk.
+                if ans.get("event") == "workflow_finished":
+                    usage = ans.get("data", {}).get("usage")
+                    if usage:
+                        real_usage = usage
                 if ans.get("event") not in ["message", "message_end"]:
                     continue
 
@@ -323,7 +339,7 @@ async def completion_openai(tenant_id, agent_id, question, session_id=None, stre
                 completion_tokens += len(tiktoken_encoder.encode(content_piece))
 
                 openai_data = get_data_openai(
-                        id=session_id or str(uuid4()),
+                        id=resolved_session_id or str(uuid4()),
                         model=agent_id,
                         content=content_piece,
                         prompt_tokens=prompt_tokens,
@@ -336,13 +352,31 @@ async def completion_openai(tenant_id, agent_id, question, session_id=None, stre
 
                 yield "data: " + json.dumps(openai_data, ensure_ascii=False) + "\n\n"
 
+            # Final usage chunk (OpenAI ``stream_options.include_usage`` shape):
+            # empty ``choices`` plus the run's real prompt/completion/total split.
+            # Falls back to the question+answer tiktoken estimate if the canvas
+            # did not surface real usage (e.g. older agent path).
+            usage_payload = real_usage or {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            }
+            yield "data: " + json.dumps(
+                get_data_openai_usage_chunk(
+                    id=resolved_session_id or str(uuid4()),
+                    model=agent_id,
+                    usage=usage_payload,
+                ),
+                ensure_ascii=False,
+            ) + "\n\n"
+
             yield "data: [DONE]\n\n"
 
         except Exception as e:
             logging.exception(e)
             yield "data: " + json.dumps(
                 get_data_openai(
-                    id=session_id or str(uuid4()),
+                    id=resolved_session_id or str(uuid4()),
                     model=agent_id,
                     content=f"**ERROR**: {str(e)}",
                     finish_reason="stop",
@@ -358,6 +392,7 @@ async def completion_openai(tenant_id, agent_id, question, session_id=None, stre
         try:
             all_content = ""
             reference = {}
+            real_usage = None  # real provider usage from the canvas run (workflow_finished)
             async for ans in completion(
                 tenant_id=tenant_id,
                 agent_id=agent_id,
@@ -368,6 +403,12 @@ async def completion_openai(tenant_id, agent_id, question, session_id=None, stre
             ):
                 if isinstance(ans, str):
                     ans = json.loads(ans[5:])
+                if ans.get("session_id"):
+                    resolved_session_id = ans["session_id"]
+                if ans.get("event") == "workflow_finished":
+                    usage = ans.get("data", {}).get("usage")
+                    if usage:
+                        real_usage = usage
                 if ans.get("event") not in ["message", "message_end"]:
                     continue
 
@@ -377,10 +418,16 @@ async def completion_openai(tenant_id, agent_id, question, session_id=None, stre
                 if ans.get("data", {}).get("reference", None):
                     reference.update(ans["data"]["reference"])
 
-            completion_tokens = len(tiktoken_encoder.encode(all_content))
+            # Prefer the canvas's real aggregated provider usage; fall back to the
+            # question+answer tiktoken estimate only when it is unavailable.
+            if real_usage:
+                prompt_tokens = real_usage.get("prompt_tokens", prompt_tokens)
+                completion_tokens = real_usage.get("completion_tokens", 0)
+            else:
+                completion_tokens = len(tiktoken_encoder.encode(all_content))
 
             openai_data = get_data_openai(
-                id=session_id or str(uuid4()),
+                id=resolved_session_id or str(uuid4()),
                 model=agent_id,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
@@ -396,7 +443,7 @@ async def completion_openai(tenant_id, agent_id, question, session_id=None, stre
         except Exception as e:
             logging.exception(e)
             yield get_data_openai(
-                id=session_id or str(uuid4()),
+                id=resolved_session_id or str(uuid4()),
                 model=agent_id,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=len(tiktoken_encoder.encode(f"**ERROR**: {str(e)}")),

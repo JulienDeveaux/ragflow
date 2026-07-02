@@ -114,21 +114,44 @@ def _build_sse_response(body):
 
 
 def _normalize_agent_session(conv):
-    conv["messages"] = conv.pop("message")
+    # Keep BOTH ``message`` (singular — consumed by the web Agent Log UI, which
+    # reads ``record.message`` and renders the detail popup) and ``messages``
+    # (plural — the SDK contract). They share the same list, so the per-message
+    # reference embedding below applies to both.
+    conv["messages"] = conv.get("message", [])
     for info in conv["messages"]:
         if "prompt" in info:
             info.pop("prompt")
     conv["agent_id"] = conv.pop("dialog_id")
-    if isinstance(conv["reference"], dict):
-        if "chunks" in conv["reference"]:
-            conv["reference"] = [conv["reference"]]
-        else:
-            conv["reference"] = [value for _, value in sorted(conv["reference"].items(), key=lambda item: int(item[0]))]
 
-    if conv["reference"]:
+    # Preserve the raw reference object for the UI. The web detail modal expects
+    # an IReferenceObject = {chunks: {id: chunk}, doc_aggs: {...}} (chunks keyed
+    # by id), which is exactly the shape agent sessions store. We keep it as the
+    # top-level ``reference`` AND still embed a flat per-message reference list
+    # for SDK consumers. Read via ``.get`` (never index ``conv["reference"]``)
+    # so a record without a ``reference`` key can't raise KeyError.
+    raw_reference = conv.get("reference")
+    if isinstance(raw_reference, dict):
+        if "chunks" in raw_reference:
+            reference_list = [raw_reference]
+        else:
+            reference_list = [value for _, value in sorted(raw_reference.items(), key=lambda item: int(item[0]))]
+    elif isinstance(raw_reference, list):
+        reference_list = raw_reference
+    else:
+        reference_list = []
+
+    if reference_list:
         messages = [message for i, message in enumerate(conv["messages"]) if i != 0 and message["role"] != "user"]
-        for message, reference in zip(messages, conv["reference"]):
-            chunks = reference["chunks"]
+        for message, reference in zip(messages, reference_list):
+            if not isinstance(reference, dict):
+                continue
+            chunks = reference.get("chunks", [])
+            # Agent sessions store ``chunks`` as a DICT keyed by chunk id (see
+            # Canvas.get_reference); chat sessions store a list. Normalize to a
+            # list of chunk dicts so iteration yields chunk objects, not str keys.
+            if isinstance(chunks, dict):
+                chunks = list(chunks.values())
             message["reference"] = [
                 {
                     "id": chunk.get("chunk_id", chunk.get("id")),
@@ -140,8 +163,11 @@ def _normalize_agent_session(conv):
                     "positions": chunk.get("positions", chunk.get("position_int")),
                 }
                 for chunk in chunks
+                if isinstance(chunk, dict)
             ]
-    del conv["reference"]
+    # Restore a UI-usable top-level reference (IReferenceObject) instead of
+    # dropping it, so the detail popup can resolve [ID:n] citations.
+    conv["reference"] = raw_reference if isinstance(raw_reference, dict) and "chunks" in raw_reference else {"chunks": {}, "doc_aggs": {}}
     return conv
 
 
