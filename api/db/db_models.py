@@ -281,7 +281,8 @@ class RetryingPooledMySQLDatabase(PooledMySQLDatabase):
                         f"Database connection issue (attempt {attempt+1}/{self.max_retries}): {e}"
                     )
                     self._handle_connection_loss()
-                    time.sleep(self.retry_delay * (2 ** attempt))
+                    if attempt > 0:
+                        time.sleep(self.retry_delay * (2 ** (attempt - 1)))
                 else:
                     logging.error(f"DB execution failure: {e}")
                     raise
@@ -324,7 +325,8 @@ class RetryingPooledMySQLDatabase(PooledMySQLDatabase):
                         f"Lost connection during transaction (attempt {attempt+1}/{self.max_retries})"
                     )
                     self._handle_connection_loss()
-                    time.sleep(self.retry_delay * (2 ** attempt))
+                    if attempt > 0:
+                        time.sleep(self.retry_delay * (2 ** (attempt - 1)))
                 else:
                     raise
         return None

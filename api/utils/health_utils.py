@@ -328,37 +328,36 @@ def check_task_executor_alive():
 
 def run_health_checks() -> tuple[dict, bool]:
     result: dict[str, str | dict] = {}
+    meta: dict[str, dict] = {}
+    started = timer()
 
-    db_ok, db_meta = check_db()
+    db_ok, meta["db"] = check_db()
     result["db"] = _ok_nok(db_ok)
-    if not db_ok:
-        result.setdefault("_meta", {})["db"] = db_meta
 
     try:
-        redis_ok, redis_meta = check_redis()
+        redis_ok, meta["redis"] = check_redis()
         result["redis"] = _ok_nok(redis_ok)
-        if not redis_ok:
-            result.setdefault("_meta", {})["redis"] = redis_meta
-    except Exception:
+    except Exception as e:
         result["redis"] = "nok"
+        meta["redis"] = {"error": str(e)}
 
     try:
-        doc_ok, doc_meta = check_doc_engine()
+        doc_ok, meta["doc_engine"] = check_doc_engine()
         result["doc_engine"] = _ok_nok(doc_ok)
-        if not doc_ok:
-            result.setdefault("_meta", {})["doc_engine"] = doc_meta
-    except Exception:
+    except Exception as e:
         result["doc_engine"] = "nok"
+        meta["doc_engine"] = {"error": str(e)}
 
     try:
-        sto_ok, sto_meta = check_storage()
+        sto_ok, meta["storage"] = check_storage()
         result["storage"] = _ok_nok(sto_ok)
-        if not sto_ok:
-            result.setdefault("_meta", {})["storage"] = sto_meta
-    except Exception:
+    except Exception as e:
         result["storage"] = "nok"
+        meta["storage"] = {"error": str(e)}
 
     all_ok = (result.get("db") == "ok") and (result.get("redis") == "ok") and (result.get("doc_engine") == "ok") and (
                 result.get("storage") == "ok")
     result["status"] = "ok" if all_ok else "nok"
+    meta["total"] = {"elapsed": f"{(timer() - started) * 1000.0:.1f}"}
+    result["_meta"] = meta
     return result, all_ok
