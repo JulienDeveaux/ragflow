@@ -193,6 +193,6 @@
     "vite-svg-loader": "^5.1.0"
   },
   "engines": {
-    "node": ">=18.20.4"
+    "node": ">=22"
   }
 }

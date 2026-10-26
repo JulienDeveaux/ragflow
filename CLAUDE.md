@@ -119,7 +119,7 @@ RAGFlow supports switching between Elasticsearch (default) and Infinity:
 ## Development Environment Requirements
 
 - Python 3.10-3.12
-- Node.js >=18.20.4
+- Node.js >=22
 - Docker & Docker Compose
 - uv package manager
 - 16GB+ RAM, 50GB+ disk space
